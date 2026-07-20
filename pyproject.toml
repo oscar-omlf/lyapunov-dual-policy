@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lyapunov-dual-policy"
+version = "0.1.0"
+description = "Lyapunov dual-policy control and formal certification"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [{name = "Oscar Miro Lopez-Feliu"}]
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.10",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "matplotlib>=3.7",
+    "statsmodels>=0.14",
+]
+test = [
+    "pytest>=7.4",
+]
+dev = [
+    "matplotlib>=3.7",
+    "pytest>=7.4",
+    "ruff>=0.8",
+    "statsmodels>=0.14",
+]
+
+[project.scripts]
+ldp = "ldp.cli:entrypoint"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["config"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = [
+    "E501", # Formatter leaves long prose and mathematical strings intact.
+    "E741", # Conventional pendulum length parameter: l.
+]

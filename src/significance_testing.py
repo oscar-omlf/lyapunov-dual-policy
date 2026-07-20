@@ -1,164 +1,158 @@
-import os
-import json 
+"""Paired statistical analysis for an ``ldp evaluate`` output directory."""
+
+import argparse
 import itertools
+import json
+from pathlib import Path
+
 import numpy as np
-
-import matplotlib.pyplot as plt
-import scipy.stats as stats
+from scipy import stats
 
 
-RUN_NUMBER = 7
-LOG_ROOT = "logs/InvertedPendulum/EVALUATION"
-ALPHA = 0.05
+def _load_run_means(path, *, nan_aware=False):
+    values = np.atleast_2d(np.loadtxt(path, delimiter=",", skiprows=1))
+    if not nan_aware:
+        return values.mean(axis=1)
+    return np.array(
+        [
+            row[np.isfinite(row)].mean() if np.isfinite(row).any() else np.nan
+            for row in values
+        ]
+    )
 
-BETAS = [round(0.1 * i, 1) for i in range(1, 10)]
-AGENTS = [f"LDP_{beta}" for beta in BETAS] \
-       + [f"LAS_TD3_{beta}" for beta in BETAS] \
-       + ["LAC", "TD3", "LQR"]
 
-run_dir = os.path.join(LOG_ROOT, f"run_{RUN_NUMBER}")
-
-def load_csv_as_array(csv_path: str, nanaware=True):
-    return np.loadtxt(csv_path, delimiter=",", skiprows=1)
-
-def per_run_mean(arr, nanaware=True):
-    if nanaware:
-        return np.nanmean(arr, axis=1)
-    return arr.mean(axis=1)
-
-returns_data = {}
-steps_data   = {}
-for agent in AGENTS:
-    agent_dir = run_dir / agent
-    ret_csv   = agent_dir / "returns.csv"
-    step_csv  = agent_dir / "steps_to_stabilize.csv"
-
-    if ret_csv.exists():
-        arr_ret = load_csv_as_array(ret_csv)
-        returns_data[agent] = per_run_mean(arr_ret, nanaware=False)
-
-    if step_csv.exists():
-        arr_step = load_csv_as_array(step_csv)
-        steps_data[agent] = per_run_mean(arr_step, nanaware=True)
-
-print("Raw mean returns:")
-stats_returns = {}
-for a, v in returns_data.items():
-    mean = v.mean()
-    sd   = v.std(ddof=1)
-    stats_returns[a] = (mean, sd)
-for a, (m, s) in sorted(stats_returns.items(), key=lambda x: x[1][0]):
-    print(f"  {a}: {m:.2f} ± {s:.2f}")
-
-print("Raw mean steps-to-stabilize:") 
-stats_steps = {}
-for a, v in steps_data.items():
-    mean = np.nanmean(v)
-    sd   = np.nanstd(v, ddof=1)
-    stats_steps[a] = (mean, sd)
-for a, (m, s) in sorted(stats_steps.items(), key=lambda x: x[1][0]):
-    print(f"  {a}: {m:.1f} ± {s:.1f}")
-
-betas = np.array(BETAS)
-mean_returns = np.array([returns_data[f"LDP_{b}"].mean() for b in betas])
-mean_steps   = np.array([np.nanmean(steps_data[f"LDP_{b}"]) for b in betas])
-
-plt.figure(figsize=(6,4))
-plt.plot(betas, mean_returns, marker='o')
-plt.xlabel("beta")
-plt.ylabel("Mean Return")
-plt.title("Mean Return vs beta")
-plt.grid(True)
-plt.tight_layout()
-plt.savefig(run_dir / "return_vs_beta.png")
-plt.close()
-
-plt.figure(figsize=(6,4))
-plt.plot(betas, mean_steps, marker='o')
-plt.xlabel("beta")
-plt.ylabel("Mean Steps to Stabilize")
-plt.title("Mean Steps vs beta")
-plt.grid(True)
-plt.tight_layout()
-plt.savefig(run_dir / "steps_vs_beta.png")
-plt.close()
-
-print(f"Saved plots: {run_dir/'return_vs_beta.png'} and {run_dir/'steps_vs_beta.png'}")
-
-def normality_table(data_dict):
-    res = {}
-    for k, v in data_dict.items():
-        stat, p = stats.shapiro(v)
-        res[k] = (stat, p)
-    return res
-
-shapiro_returns = normality_table(returns_data)
-shapiro_steps   = normality_table({k:v for k,v in steps_data.items() if np.isfinite(v).any()})
-
-lev_stat, lev_p = stats.levene(*returns_data.values())
-print(f"Levene's test - Returns: stat={lev_stat:.3f}, p={lev_p:.4g}")
-
-valid_runs = [v[~np.isnan(v)] for v in steps_data.values() if np.isfinite(v).any()]
-if len(valid_runs) >= 2:
-    lev_s, lev_ps = stats.levene(*valid_runs)
-    print(f"Levene's test - Steps: stat={lev_s:.3f}, p={lev_ps:.4g}")
-else:
-    print("Levene's test - Steps: not enough groups with data to run Levene's test")
-
-def one_way_tests(data_dict):
-    samples = list(data_dict.values())
-    F, p_anova = stats.f_oneway(*samples)
-    H, p_kw    = stats.kruskal(*samples)
-    return {"ANOVA_F": F, "ANOVA_p": p_anova,
-            "Kruskal_H": H, "Kruskal_p": p_kw}
-
-anova_ret   = one_way_tests(returns_data)
-anova_steps = one_way_tests({k:v for k,v in steps_data.items() if np.isfinite(v).any()})
-
-import itertools
-def pairwise_tests(data_dict):
-    pairs = list(itertools.combinations(data_dict.keys(), 2))
-    raw_p = {}
-    for a, b in pairs:
-        _, p = stats.ttest_ind(data_dict[a], data_dict[b], equal_var=False, nan_policy='omit')
-        raw_p[(a, b)] = p
-    m = len(raw_p)
-    sorted_p = sorted(raw_p.items(), key=lambda x: x[1])
+def _holm_adjust(raw_p_values):
+    ordered = sorted(raw_p_values, key=raw_p_values.get)
     adjusted = {}
-    for i, ((a, b), pval) in enumerate(sorted_p, start=1):
-        adjusted[(a, b)] = min((m - i + 1) * pval, 1.0)
-    return raw_p, adjusted
+    running_max = 0.0
+    total = len(ordered)
+    for rank, pair in enumerate(ordered):
+        candidate = min((total - rank) * raw_p_values[pair], 1.0)
+        running_max = max(running_max, candidate)
+        adjusted[pair] = running_max
+    return adjusted
 
-raw_p_ret, adj_p_ret = pairwise_tests(returns_data)
-valid_steps = {k:v for k,v in steps_data.items() if np.isfinite(v).any()}
-raw_p_steps, adj_p_steps = ({}, {}) if len(valid_steps)<2 else pairwise_tests(valid_steps)
+
+def _paired_tests(data):
+    raw = {}
+    details = {}
+    for first, second in itertools.combinations(sorted(data), 2):
+        first_values = data[first]
+        second_values = data[second]
+        if first_values.shape != second_values.shape:
+            raise ValueError(f"Paired runs differ in shape: {first!r} and {second!r}")
+        valid = np.isfinite(first_values) & np.isfinite(second_values)
+        if valid.sum() < 2:
+            continue
+        differences = first_values[valid] - second_values[valid]
+        difference_sd = differences.std(ddof=1)
+        if difference_sd == 0:
+            if differences.mean() == 0:
+                statistic, p_value = 0.0, 1.0
+            else:
+                statistic, p_value = None, 0.0
+        else:
+            test = stats.ttest_rel(first_values[valid], second_values[valid])
+            statistic, p_value = float(test.statistic), float(test.pvalue)
+        pair = (first, second)
+        raw[pair] = p_value
+        details[pair] = {
+            "n_pairs": int(valid.sum()),
+            "mean_difference": float(differences.mean()),
+            "paired_t": statistic,
+            "p_raw": p_value,
+        }
+    adjusted = _holm_adjust(raw)
+    for pair, value in adjusted.items():
+        details[pair]["p_holm"] = float(value)
+    return {
+        f"{first} vs {second}": result for (first, second), result in details.items()
+    }
 
 
-def fmt_pairwise(pdict):
-    return "".join(f"{a} vs {b}: p={p:.4g}" for (a,b),p in sorted(pdict.items()))
+def analyze(run_dir, agents):
+    costs = {agent: _load_run_means(run_dir / agent / "costs.csv") for agent in agents}
+    step_means = {
+        agent: _load_run_means(
+            run_dir / agent / "steps_to_stabilize.csv", nan_aware=True
+        )
+        for agent in agents
+    }
+    convergence = {
+        agent: np.atleast_1d(
+            np.loadtxt(
+                run_dir / agent / "episodes_stabilized.csv",
+                delimiter=",",
+                skiprows=1,
+                usecols=1,
+            )
+        )
+        for agent in agents
+    }
 
-print("Normality (Returns)")
-for k,(s,p) in shapiro_returns.items():
-    print(f"  {k}: stat={s:.3f}, p={p:.4g}")
+    run_counts = {len(values) for values in costs.values()}
+    if len(run_counts) != 1:
+        raise ValueError("All agents must have the same paired run count")
 
-print("Normality (Steps)")
-for k,(s,p) in shapiro_steps.items():
-    print(f"  {k}: stat={s:.3f}, p={p:.4g}")
+    result = {
+        "descriptive": {
+            agent: {
+                "mean_cost": float(costs[agent].mean()),
+                "sd_run_mean_cost": (
+                    float(costs[agent].std(ddof=1)) if costs[agent].size > 1 else 0.0
+                ),
+                "mean_steps_successful_runs": (
+                    float(np.nanmean(step_means[agent]))
+                    if np.isfinite(step_means[agent]).any()
+                    else None
+                ),
+                "mean_episodes_stabilized": float(convergence[agent].mean()),
+            }
+            for agent in agents
+        },
+        "paired_cost_tests": _paired_tests(costs),
+        "paired_conditional_step_tests": _paired_tests(step_means),
+        "paired_convergence_count_tests": _paired_tests(convergence),
+    }
+    if len(agents) >= 3:
+        friedman = stats.friedmanchisquare(*(costs[agent] for agent in agents))
+        result["friedman_cost"] = {
+            key: float(value) if np.isfinite(value) else None
+            for key, value in zip(
+                ("statistic", "p_value"),
+                friedman,
+            )
+        }
+    return result
 
-print("One-way tests - Returns")
-print(json.dumps(anova_ret, indent=2))
-print("One-way tests - Steps")
-print(json.dumps(anova_steps, indent=2))
 
-print("Pairwise Welch t-tests - Returns (raw p)")
-print(fmt_pairwise(raw_p_ret))
-print("Pairwise Welch t-tests - Returns (Holm-adjusted)")
-print(fmt_pairwise(adj_p_ret))
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Run paired tests on ldp evaluation outputs"
+    )
+    parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--agents", nargs="+")
+    parser.add_argument("--output", type=Path)
+    return parser
 
-if raw_p_steps:
-    print("Pairwise Welch t-tests - Steps (raw p)")
-    print(fmt_pairwise(raw_p_steps))
-    print("Pairwise Welch t-tests - Steps (Holm-adjusted)")
-    print(fmt_pairwise(adj_p_steps))
-else:
-    print("No valid pairwise step comparisons (only one agent produced finite data).")
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    agents = args.agents or sorted(
+        path.name
+        for path in args.run_dir.iterdir()
+        if path.is_dir() and (path / "costs.csv").exists()
+    )
+    if len(agents) < 2:
+        raise ValueError("At least two evaluated agents are required")
+    result = analyze(args.run_dir, agents)
+    rendered = json.dumps(result, indent=2, sort_keys=True, allow_nan=False)
+    print(rendered)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

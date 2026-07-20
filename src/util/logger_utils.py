@@ -1,58 +1,74 @@
-import os
 import json
 import logging
+from pathlib import Path
 
-def setup_run_directory_and_logging(config: dict, base_log_dir: str = "logs", evaluation: bool = False):
-    
+import numpy as np
+
+
+def _jsonable(value):
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if callable(value):
+        module = getattr(value, "__module__", "")
+        name = getattr(value, "__qualname__", repr(value))
+        return f"{module}.{name}".lstrip(".")
+    return value
+
+
+def save_json(data, path):
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as stream:
+        json.dump(_jsonable(data), stream, indent=2, sort_keys=True)
+        stream.write("\n")
+
+
+def setup_run_directory_and_logging(
+    config,
+    base_log_dir="runs",
+    evaluation=False,
+):
     try:
-        env_name = config["environment"]
-    except KeyError:
-        raise KeyError("The configuration dictionary must include an 'environment' key.")
-    
-    try:
+        environment = config["environment"]
         model_name = config["model_name"]
-    except KeyError:
-        raise KeyError("The configuration dictionary must include a 'model_name' key.")
-    
-    # Create a folder at base_log_dir/env_name/model_name
-    model_dir = os.path.join(base_log_dir, env_name, model_name)    
-    os.makedirs(model_dir, exist_ok=True)
+    except KeyError as exc:
+        raise KeyError("Configuration requires environment and model_name") from exc
 
-    existing_runs = [d for d in os.listdir(model_dir) if d.startswith("run_") and os.path.isdir(os.path.join(model_dir, d))]
-    if not existing_runs:
-        run_number = 0
-    else:
-        max_run = max([int(d.split('_')[1]) for d in existing_runs])
-        run_number = max_run + 1
+    model_dir = Path(base_log_dir) / environment / model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    run_number = 0
+    while True:
+        run_dir = model_dir / f"run_{run_number:03d}"
+        try:
+            run_dir.mkdir()
+            break
+        except FileExistsError:
+            run_number += 1
 
-    run_dir = os.path.join(model_dir, f"run_{run_number}/")
-    os.makedirs(run_dir)
-    print(f"Starting new run in: {run_dir}")
-
-    logger = logging.getLogger(f"{model_name}_run_{run_number}")
+    logger = logging.getLogger(f"{model_name}.run_{run_number:03d}")
     logger.setLevel(logging.INFO)
-    
-    for handler in logger.handlers[:]:
+    logger.propagate = False
+    for handler in list(logger.handlers):
+        handler.close()
         logger.removeHandler(handler)
-        
-    if evaluation is False:
-        log_file = 'training.log'
-    else:
-        log_file = 'model_evaluation.log'
 
-    log_file_path = os.path.join(run_dir, log_file)
-    file_handler = logging.FileHandler(log_file_path)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    log_name = "evaluation.log" if evaluation else "training.log"
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    file_handler = logging.FileHandler(run_dir / log_name)
+    file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
-    
     stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    stream_handler.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
     logger.addHandler(stream_handler)
-    
-    logger.info("Starting Run")
-    logger.info(f"Run Directory: {run_dir}")
-    config_str = json.dumps(config, indent=4, default=str)
-    if evaluation is False:
-        logger.info(f"Hyperparameters:\n{config_str}")
-    
+
+    save_json(config, run_dir / "config.json")
+    logger.info("Run directory: %s", run_dir)
     return run_dir, logger

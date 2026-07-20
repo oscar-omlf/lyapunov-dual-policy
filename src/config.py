@@ -1,10 +1,12 @@
+from copy import deepcopy
+
 import numpy as np
 
 from util.dynamics import (
-    pendulum_dynamics_torch,
-    pendulum_dynamics_np,
+    compute_pendulum_reward,
     pendulum_dynamics_dreal,
-    compute_pendulum_reward
+    pendulum_dynamics_np,
+    pendulum_dynamics_torch,
 )
 
 DT = 0.003
@@ -42,8 +44,12 @@ config_ldp_pendulum = {
     "norm_threshold": 5e-2,
     "integ_threshold": 500,
     "dt": DT,
-    "actor_hidden_sizes":  (5, 5),
-    "critic_hidden_sizes": (20, 20),
+    "rollout_steps": 3000,
+    "rollout_refresh_interval": 10,
+    "plot_interval": 0,
+    "plot_grid_size": 201,
+    "actor_hidden_sizes": (5, 5),
+    "critic_hidden_sizes": (10, 10),
     "state_space": np.zeros(2),
     "action_space": np.zeros(1),
     "r1_bounds": (np.array([-2.0, -4.0]), np.array([2.0, 4.0])),
@@ -60,17 +66,21 @@ config_lac_pendulum = {
     "dynamics_fn": pendulum_dynamics_torch,
     "dynamics_fn_dreal": pendulum_dynamics_dreal,
     "batch_size": 128,
-    "num_paths_sampled": 16,
+    "num_paths_sampled": 8,
     "dt": DT,
+    "rollout_steps": 3000,
+    "rollout_refresh_interval": 10,
+    "plot_interval": 0,
+    "plot_grid_size": 201,
     "norm_threshold": 5e-2,
     "integ_threshold": 500,
     "r1_bounds": (np.array([-2.0, -4.0]), np.array([2.0, 4.0])),
-    "actor_hidden_sizes": (5, 5), 
-    "critic_hidden_sizes": (20, 20),
-    "state_space": np.zeros(2), 
-    "action_space": np.zeros(1), 
+    "actor_hidden_sizes": (5, 5),
+    "critic_hidden_sizes": (10, 10),
+    "state_space": np.zeros(2),
+    "action_space": np.zeros(1),
     "max_action": 1.0,
-    "normalize_gradients": False
+    "normalize_gradients": False,
 }
 
 config_las_td3_pendulum = {
@@ -84,7 +94,7 @@ config_las_td3_pendulum = {
         "agent_str": "LQR",
         "environment": "InvertedPendulum",
         "discrete_discounted": True,
-        "gamma": 0.99,
+        "gamma": 0.9,
         "dt": DT,
         "g": PENDULUM_G,
         "m": PENDULUM_M,
@@ -101,23 +111,23 @@ config_las_td3_pendulum = {
     "policy_noise": 0.2,
     "noise_clip": 0.5,
     "expl_noise": 0.1,
-    "actor_lr": 3e-4,
-    "critic_lr": 3e-4,
+    "actor_lr": 1e-4,
+    "critic_lr": 1e-4,
     "actor_hidden_sizes": (256, 256),
     "critic_hidden_sizes": (256, 256),
     "state_space": np.zeros(2),
     "action_space": np.zeros(1),
     "r1_bounds": (np.array([-2.0, -4.0]), np.array([2.0, 4.0])),
     "c_star": 1.1982,
-    }
+}
 
 
 config_td3_pendulum = {
     "agent_str": "TD3",
     "model_name": "TD3",
     "environment": "InvertedPendulum",
-    "actor_lr": 3e-4,
-    "critic_lr": 3e-4,
+    "actor_lr": 1e-4,
+    "critic_lr": 1e-4,
     "gamma": 0.99,
     "tau": 0.005,
     "batch_size": 256,
@@ -147,7 +157,26 @@ config_lqr_pendulum = {
     "l": PENDULUM_L,
     "b": PENDULUM_B,
     "max_action": MAX_ACTION,
+    "dynamics_fn_dreal": pendulum_dynamics_dreal,
     "r1_bounds": (np.array([-2.0, -4.0]), np.array([2.0, 4.0])),
     "state_space": np.zeros(2),
     "action_space": np.zeros(1),
 }
+
+
+CONFIGS = {
+    "ldp": config_ldp_pendulum,
+    "lac": config_lac_pendulum,
+    "las-td3": config_las_td3_pendulum,
+    "td3": config_td3_pendulum,
+    "lqr": config_lqr_pendulum,
+}
+
+
+def get_config(name: str) -> dict:
+    """Return an isolated experiment configuration."""
+    try:
+        return deepcopy(CONFIGS[name.lower()])
+    except KeyError as exc:
+        choices = ", ".join(sorted(CONFIGS))
+        raise ValueError(f"Unknown config {name!r}; choose from {choices}") from exc

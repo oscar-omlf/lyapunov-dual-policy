@@ -1,92 +1,79 @@
-import os
+"""Pilot-based power calculations for paired evaluation runs."""
+
+import argparse
+import itertools
+from pathlib import Path
+
 import numpy as np
-import pandas as pd
-from statsmodels.stats.power import TTestIndPower
+from statsmodels.stats.power import TTestPower
 
-RUN_NUMBER = 5
-LOG_ROOT = "logs/InvertedPendulum/EVALUATION"
-AGENTS = ["LAC", "LDP", "TD3", "LQR"]
-ALPHA = 0.05
-POWER = 0.95
-MIN_SAMPLES = 2
 
-run_dir = os.path.join(LOG_ROOT, f"run_{RUN_NUMBER}")
+def _run_means(path, *, nan_aware=False):
+    values = np.loadtxt(path, delimiter=",", skiprows=1)
+    values = np.atleast_2d(values)
+    reducer = np.nanmean if nan_aware else np.mean
+    return reducer(values, axis=1)
 
-returns = {}
-for agent in AGENTS:
-    csv_path = run_dir / agent / "returns.csv"
-    data = np.loadtxt(csv_path, delimiter=",", skiprows=1)
-    returns[agent] = data.mean(axis=1)
 
-pairs = [(i,j) for idx,i in enumerate(AGENTS) for j in AGENTS[idx+1:]]
-d_vals = {}
-for i,j in pairs:
-    xi, xj = returns[i], returns[j]
-    ni, nj = len(xi), len(xj)
-    si, sj = xi.std(ddof=1), xj.std(ddof=1)
-    pooled = np.sqrt(((ni-1)*si**2 + (nj-1)*sj**2)/(ni+nj-2))
-    d_vals[(i,j)] = abs(xi.mean() - xj.mean())/pooled
+def _paired_effect(first, second):
+    valid = np.isfinite(first) & np.isfinite(second)
+    differences = first[valid] - second[valid]
+    if differences.size < 2:
+        return None
+    standard_deviation = differences.std(ddof=1)
+    if standard_deviation == 0:
+        return np.inf if differences.mean() != 0 else 0.0
+    return abs(differences.mean()) / standard_deviation
 
-m = len(d_vals)
-alpha_adj = ALPHA / m
 
-tool = TTestIndPower()
-req_n_return = {}
-for pair,d in d_vals.items():
-    try:
-        n = tool.solve_power(
-            effect_size=d,
-            nobs1=None,
-            alpha=alpha_adj,
-            power=POWER,
-            ratio=1.0,
-            alternative='two-sided')
-        req_n = max(int(np.ceil(n)), MIN_SAMPLES)
-    except Exception:
-        req_n = MIN_SAMPLES
-    req_n_return[pair] = req_n
+def required_pairs(effect_size, *, alpha, power):
+    if effect_size is None:
+        return None
+    if np.isinf(effect_size):
+        return 2
+    if effect_size <= 0:
+        return None
+    estimate = TTestPower().solve_power(
+        effect_size=effect_size,
+        nobs=None,
+        alpha=alpha,
+        power=power,
+        alternative="two-sided",
+    )
+    return max(2, int(np.ceil(estimate)))
 
-st_ldp = np.loadtxt(run_dir/"LDP"/"steps_to_stabilize.csv", delimiter=",", skiprows=1)
-st_lqr = np.loadtxt(run_dir/"LQR"/"steps_to_stabilize.csv", delimiter=",", skiprows=1)
-steps_ldp = np.nanmean(st_ldp, axis=1)
-steps_lqr = np.nanmean(st_lqr, axis=1)
 
-n1,n2 = len(steps_ldp), len(steps_lqr)
-s1,s2 = steps_ldp.std(ddof=1), steps_lqr.std(ddof=1)
-pooled_sd = np.sqrt(((n1-1)*s1**2 + (n2-1)*s2**2)/(n1+n2-2))
-d_steps = abs(steps_ldp.mean() - steps_lqr.mean())/pooled_sd
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Estimate paired run counts from pilot evaluation data"
+    )
+    parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--agents", nargs="+", required=True)
+    parser.add_argument("--alpha", type=float, default=0.05)
+    parser.add_argument("--power", type=float, default=0.95)
+    return parser
 
-try:
-    n_st = tool.solve_power(effect_size=d_steps,
-                             nobs1=None,
-                             alpha=ALPHA,
-                             power=POWER,
-                             ratio=1.0,
-                             alternative='two-sided')
-    req_n_steps = max(int(np.ceil(n_st)), MIN_SAMPLES)
-except Exception:
-    req_n_steps = MIN_SAMPLES
 
-df_rows = []
-for (i,j),n in req_n_return.items():
-    df_rows.append({
-        "Metric":      "Return",
-        "Comparison":  f"{i} vs {j}",
-        "Cohen_d":     round(d_vals[(i,j)],3),
-        "Alpha_adj":   round(alpha_adj,4),
-        "Power":       POWER,
-        "Req_n/group": n
-    })
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    costs = {
+        agent: _run_means(args.run_dir / agent / "costs.csv") for agent in args.agents
+    }
+    pairs = list(itertools.combinations(args.agents, 2))
+    adjusted_alpha = args.alpha / max(len(pairs), 1)
 
-df_rows.append({
-    "Metric":      "Steps",
-    "Comparison":  "LDP vs LQR",
-    "Cohen_d":     round(d_steps,3),
-    "Alpha_adj":   ALPHA,
-    "Power":       POWER,
-    "Req_n/group": req_n_steps
-})
+    print("metric,comparison,paired_effect,alpha,power,required_runs")
+    for first, second in pairs:
+        effect = _paired_effect(costs[first], costs[second])
+        required = required_pairs(effect, alpha=adjusted_alpha, power=args.power)
+        effect_text = "" if effect is None else f"{effect:.6g}"
+        required_text = "" if required is None else str(required)
+        print(
+            f"cost,{first} vs {second},{effect_text},"
+            f"{adjusted_alpha:.6g},{args.power:.6g},{required_text}"
+        )
+    return 0
 
-df = pd.DataFrame(df_rows)
-print("\n=== Prior Power Analysis (95% power, Bonferroni-adjusted) ===")
-print(df.to_string(index=False))
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,84 +1,120 @@
-import dreal as d
+"""Small, shared dReal helpers.
+
+dReal is intentionally optional at import time. Numerical training and
+evaluation can run without it; certification calls fail with an actionable
+message when the solver bindings are unavailable.
+"""
+
+from typing import Any
+
 import numpy as np
 
-def dreal_var(n: int, prefix="x"):
+try:
+    import dreal as _dreal
+except ImportError:  # pragma: no cover - exercised on platforms without dReal
+    _dreal = None
+
+
+def require_dreal():
+    if _dreal is None:
+        raise RuntimeError(
+            "dReal Python bindings are required for certification. Install "
+            "the platform-specific dReal package described in README.md."
+        )
+    return _dreal
+
+
+def dreal_var(n: int, prefix: str = "x"):
+    d = require_dreal()
     return np.array([d.Variable(f"{prefix}{i}") for i in range(n)])
+
 
 def dreal_elementwise(x, func):
     return np.array([func(xi) for xi in x])
 
+
 def dreal_sigmoid(z):
+    d = require_dreal()
     return 1 / (1 + d.exp(-z))
 
-def in_box(x, lb, ub, scale=1.0):
-    return d.And(*[d.And(x[i] >= lb[i]*scale, x[i] <= ub[i]*scale)
-                   for i in range(len(x))])
 
-def on_boundary(x, lb, ub, scale=2.0, pad=0.01):
+def dreal_clip(value, lower: float, upper: float):
+    d = require_dreal()
+    return d.if_then_else(
+        value > upper,
+        upper,
+        d.if_then_else(value < lower, lower, value),
+    )
+
+
+def dreal_clip_vector(values, lower: float, upper: float):
+    return np.array([dreal_clip(value, lower, upper) for value in values])
+
+
+def quadratic_form(x, matrix):
+    return sum(
+        x[i] * sum(matrix[i, j] * x[j] for j in range(len(x))) for i in range(len(x))
+    )
+
+
+def squared_norm(x):
+    return sum(xi * xi for xi in x)
+
+
+def in_box(x, lb, ub, scale: float = 1.0):
+    d = require_dreal()
+    return d.And(
+        *[d.And(x[i] >= lb[i] * scale, x[i] <= ub[i] * scale) for i in range(len(x))]
+    )
+
+
+def on_boundary(x, lb, ub, scale: float = 2.0, pad: float = 0.01):
+    """Return a thin inner shell containing the complete box boundary."""
+    if not 0 < pad < 1:
+        raise ValueError("pad must lie in (0, 1)")
+    d = require_dreal()
     outer = in_box(x, lb, ub, scale)
-    inner = in_box(x, lb, ub, scale*(1-pad))
+    inner = in_box(x, lb, ub, scale * (1 - pad))
     return d.And(outer, d.Not(inner))
 
-def on_boundry_dreal(self, x, scale=2.0):
-    condition1 = d.And(
-        x[0] >= self.lb[0] * scale * 0.99,
-        x[0] <= self.ub[0] * scale * 0.99,
-        x[1] >= self.lb[1] * scale * 0.99,
-        x[1] <= self.ub[1] * scale * 0.99
-    )
-    condition2 = d.Not(
-        d.And(
-            x[0] >= self.lb[0] * scale * 0.97,
-            x[0] <= self.ub[0] * scale * 0.97,
-            x[1] >= self.lb[1] * scale * 0.97,
-            x[1] <= self.ub[1] * scale * 0.97
-        )
-    )
-    return d.And( condition1, condition2 )
 
-def is_unsat(result) -> bool:
-    """True iff dReal returned UNSAT."""
+def is_unsat(result: Any) -> bool:
+    """Return true only when dReal proved the query UNSAT."""
     return result is None or (isinstance(result, str) and result.lower() == "unsat")
 
 
-def dreal_in_circle(x: list, radius: float) -> d.Formula:
-    x_norm_sq = sum(xi**2 for xi in x)
-    return x_norm_sq <= radius**2
+def dreal_in_circle(x, radius: float):
+    return squared_norm(x) <= radius**2
 
 
-def dreal_on_circle_boundary(x: list, radius: float) -> d.Formula:
-    """
-    Returns a dreal formula for checking if a point x is on the boundary of a circle.
-    NOTE: Using a small tolerance band can be more robust for SMT solvers.
-    """
-    x_norm_sq = sum(xi**2 for xi in x)
-    # A strict equality can be hard for solvers. A thin band is often better.
-    tolerance = 1e-4
+def dreal_on_circle_boundary(x, radius: float, tolerance: float = 1e-4):
+    d = require_dreal()
+    norm_sq = squared_norm(x)
     return d.And(
-        x_norm_sq <= (radius + tolerance)**2,
-        x_norm_sq >= (radius - tolerance)**2
+        norm_sq <= (radius + tolerance) ** 2,
+        norm_sq >= (radius - tolerance) ** 2,
     )
 
 
-def extract_ce_from_model(model, state_dim):
-    if not model:
-        return np.zeros(state_dim)
+def extract_ce_from_model(model, state_dim: int):
+    d = require_dreal()
+    if model is None:
+        return None
 
-    ce = np.zeros(state_dim)
-    
-    for var, val in model.items():
-        var_name = str(var)
-        
-        if var_name.startswith('x'):
-            try:
-                i = int(var_name[1:])
-                
-                if 0 <= i < state_dim:
-                    if isinstance(val, d.Interval):
-                        ce[i] = val.mid()
-                    else:
-                        ce[i] = val
-            except (ValueError, IndexError):
-                continue
-                
-    return ce
+    counterexample = np.zeros(state_dim, dtype=np.float64)
+    found = np.zeros(state_dim, dtype=bool)
+    for variable, value in model.items():
+        name = str(variable)
+        if not name.startswith("x"):
+            continue
+        try:
+            index = int(name[1:])
+        except ValueError:
+            continue
+        if not 0 <= index < state_dim:
+            continue
+        counterexample[index] = (
+            value.mid() if isinstance(value, d.Interval) else float(value)
+        )
+        found[index] = True
+    return counterexample if found.all() else None

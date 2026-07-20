@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from models.mlp import MLP
+
 
 class TD3Critic(nn.Module):
     def __init__(self, state_dim, hidden_sizes, action_dim):

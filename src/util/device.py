@@ -1,14 +1,12 @@
 import torch
 
-"""
-Use this when you reaaaly want to make sure pytorch is using your GPU.
-"""
 
-
-def fetch_device() -> str:
-    """
-    Returns 'cuda' if GPU is available otherwise 'cpu'.
-    Can be used to determine where to move tensors to.
-    :return: string 'cuda' or 'cpu'.
-    """
-    return 'cuda' if torch.cuda.is_available() else 'cpu'
+def fetch_device(preferred: str = "auto") -> str:
+    """Resolve an explicit device or choose the best available accelerator."""
+    if preferred != "auto":
+        return str(torch.device(preferred))
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"

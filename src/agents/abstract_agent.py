@@ -1,38 +1,58 @@
+import random
 from abc import ABC, abstractmethod
-import gymnasium as gym
 
 from util.device import fetch_device
 
+
 class ReplayBuffer:
-    def __init__(self):
-        self.buffer = []
-        
+    """Fixed-capacity replay buffer with O(1) insertion and no batch copy."""
+
+    def __init__(self, capacity: int = 1_000_000):
+        if capacity <= 0:
+            raise ValueError("Replay-buffer capacity must be positive")
+        self.capacity = int(capacity)
+        self._storage = []
+        self._size = 0
+        self._next = 0
+
     def push(self, transition):
-        self.buffer.append(transition)
+        if self._size < self.capacity:
+            self._storage.append(transition)
+            self._size += 1
+        else:
+            self._storage[self._next] = transition
+        self._next = (self._next + 1) % self.capacity
 
     def clear(self):
-        self.buffer.clear()
-
-    def popleft(self):
-        return self.buffer.popleft()
+        self._storage.clear()
+        self._size = 0
+        self._next = 0
 
     def get_buffer_list(self):
-        return list(self.buffer)
-        
+        if self._size < self.capacity:
+            return self._storage[: self._size]
+        return self._storage[self._next :] + self._storage[: self._next]
+
+    def sample(self, batch_size: int):
+        if batch_size > self._size:
+            raise ValueError(f"Cannot sample {batch_size} items from {self._size}")
+        indices = random.sample(range(self._size), batch_size)
+        return [self._storage[index] for index in indices]
+
     def __len__(self):
-        return len(self.buffer)
+        return self._size
+
 
 class AbstractAgent(ABC):
     def __init__(self, config: dict):
-
         self.state_space = config.get("state_space")
         self.action_space = config.get("action_space")
+        if self.state_space is None or self.action_space is None:
+            raise ValueError("state_space and action_space are required")
         self.state_dim = self.state_space.shape[0]
         self.action_dim = self.action_space.shape[0]
-        self.device = fetch_device()
-        self._replay_buffer = ReplayBuffer()
-
-        # print(f'Device: {self.device}')
+        self.device = fetch_device(config.get("device", "auto"))
+        self._replay_buffer = ReplayBuffer(config.get("replay_capacity", 1_000_000))
 
     @abstractmethod
     def add_transition(self, transition):
@@ -41,14 +61,14 @@ class AbstractAgent(ABC):
 
         :param transition: transition to add to the replay buffer.
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def update(self) -> None:
         """
         Abstract method where the update rule is applied.
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def policy(self, state):
@@ -61,22 +81,22 @@ class AbstractAgent(ABC):
 
         :param state: The current state of the environment.
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
-    def save(self, file_path: str = './') -> None:
+    def save(self, file_path: str = "./") -> None:
         """
         Abstract method to save the agent's model.
 
         :param file_path: The path to save the model.
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
-    def load(self, file_path: str = './') -> None:
+    def load(self, file_path: str = "./") -> None:
         """
         Abstract method to load the agent's model.
 
         :param file_path: The path to load the model from.
         """
-        pass
+        raise NotImplementedError

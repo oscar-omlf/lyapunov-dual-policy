@@ -1,19 +1,30 @@
-import os
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-import dreal as d
 
 from agents.abstract_agent import AbstractAgent
 from trainers.abstract_trainer import Trainer
-from util.sampling import sample_in_region_torch, sample_out_of_region_torch
-from util.sampling import sample_in_lqr_ellipsoid_torch
-from util.rk4_step import rk4_step
-from util.dreal import dreal_var, in_box, on_boundary, is_unsat
+from util.dreal import (
+    dreal_var,
+    in_box,
+    is_unsat,
+    on_boundary,
+    require_dreal,
+    squared_norm,
+)
+from util.sampling import (
+    sample_in_region_torch,
+    sample_out_of_region_torch,
+)
+from util.simulation import RolloutResult, rollout_running_cost
 
 
 class LAS_LyapunovAC_Trainer(Trainer):
+    """Physics-informed trainer and verifier for the composite LDP system."""
+
     def __init__(
         self,
         agent: AbstractAgent,
@@ -21,7 +32,7 @@ class LAS_LyapunovAC_Trainer(Trainer):
         batch_size: int,
         num_paths_sampled: int,
         norm_threshold: float,
-        integ_threshold: int,
+        integ_threshold: float,
         dt: float,
         dynamics_fn: callable,
         dynamics_fn_dreal: callable,
@@ -30,302 +41,359 @@ class LAS_LyapunovAC_Trainer(Trainer):
         r1_bounds: list,
         run_dir: str,
         device: str,
+        rollout_steps: int = 3000,
+        rollout_refresh_interval: int = 10,
+        plot_interval: int = 0,
+        plot_grid_size: int = 201,
     ):
         super().__init__()
         self.agent = agent
-        self.alpha_zubov = alpha_zubov
-        self.batch_size = batch_size
-        self.num_paths_sampled = num_paths_sampled
-        self.norm_threshold = norm_threshold
-        self.integ_threshold = integ_threshold
-        self.dt = dt
-
+        self.alpha_zubov = float(alpha_zubov)
+        self.batch_size = int(batch_size)
+        self.num_paths_sampled = int(num_paths_sampled)
+        self.norm_threshold = float(norm_threshold)
+        self.integ_threshold = float(integ_threshold)
+        self.dt = float(dt)
         self.dynamics_fn = dynamics_fn
         self.dynamics_fn_dreal = dynamics_fn_dreal
-
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.lb, self.ub = r1_bounds
-
-        self.run_dir = run_dir
-
+        self.state_dim = int(state_dim)
+        self.action_dim = int(action_dim)
+        self.lb, self.ub = (
+            np.asarray(r1_bounds[0]),
+            np.asarray(r1_bounds[1]),
+        )
+        self.run_dir = Path(run_dir) if run_dir else None
         self.device = device
+        self.rollout_steps = int(rollout_steps)
+        self.rollout_refresh_interval = int(rollout_refresh_interval)
+        self.plot_interval = int(plot_interval)
+        self.plot_grid_size = int(plot_grid_size)
+        if self.rollout_refresh_interval <= 0:
+            raise ValueError("rollout_refresh_interval must be positive")
 
-        self.lb_tensor = torch.tensor(self.lb, dtype=torch.float32, device=self.device)
-        self.ub_tensor = torch.tensor(self.ub, dtype=torch.float32, device=self.device)
-
+        self.lb_tensor = torch.as_tensor(
+            self.lb, dtype=torch.float32, device=self.device
+        )
+        self.ub_tensor = torch.as_tensor(
+            self.ub, dtype=torch.float32, device=self.device
+        )
         self.timesteps = 0
+        self._rollout_states: Optional[torch.Tensor] = None
+        self._rollout_targets: Optional[torch.Tensor] = None
+        self.last_rollout: Optional[RolloutResult] = None
+        self.last_losses = {}
+        self.last_verification = {}
+        self._local_bridge_cache = {}
 
-        print('Lyapunov Trainer Initialized (Dual-Policy Lyapunov AC)!')
+    def _refresh_rollout_targets(self):
+        states = sample_in_region_torch(
+            self.num_paths_sampled,
+            self.lb_tensor,
+            self.ub_tensor,
+            self.device,
+        )
+        rollout = rollout_running_cost(
+            initial_state=states,
+            dynamics=self.dynamics_fn,
+            policy=lambda x: self.agent.action_tensor(x, noise=False),
+            dt=self.dt,
+            max_steps=self.rollout_steps,
+            convergence_threshold=self.norm_threshold,
+            running_cost_limit=self.integ_threshold,
+        )
+        self._rollout_states = states
+        self._rollout_targets = rollout.zubov_target(self.alpha_zubov)
+        self.last_rollout = rollout
 
-    def train(self, counter_examples: list = None, normalize_gradients: bool = False):
-        init_states = sample_in_region_torch(self.num_paths_sampled, self.lb_tensor, self.ub_tensor, self.device)
-        # init_states = sample_in_lqr_ellipsoid_torch(self.num_paths_sampled, self.agent.c_star, self.agent.L_inv, self.device)
-        traj, values, _ = self.simulate_trajectories(init_states, max_steps=3000)
-        values = values.to(dtype=torch.float32, device=self.device)
+    def _physics_samples(self, counter_examples):
+        if not counter_examples:
+            return sample_in_region_torch(
+                self.batch_size,
+                self.lb_tensor,
+                self.ub_tensor,
+                self.device,
+            )
 
-        # 1) Enforce W(0) = 0
-        zero_tensor = torch.zeros((1, self.state_dim), device=self.device)
-        W_zeros = self.agent.critic_model(zero_tensor)
-        Lz = 5.0 * torch.square(W_zeros)
+        counterexample_tensor = torch.as_tensor(
+            counter_examples, dtype=torch.float32, device=self.device
+        ).reshape(-1, self.state_dim)
+        counterexample_tensor = counterexample_tensor[-self.batch_size :]
+        random_count = self.batch_size - counterexample_tensor.shape[0]
+        random_samples = sample_in_region_torch(
+            random_count,
+            self.lb_tensor,
+            self.ub_tensor,
+            self.device,
+        )
+        return torch.cat((counterexample_tensor, random_samples), dim=0)
 
-        # 2) Enforce W(x) = tanh(alpha * V(x))
-        Wx_Lr = self.agent.get_composite_W_value(init_states)
-        target = torch.tanh(self.alpha_zubov * values)
-        Lr = F.mse_loss(Wx_Lr, target)
+    def train(self, counter_examples=None, normalize_gradients=False):
+        if (
+            self._rollout_states is None
+            or self.timesteps % self.rollout_refresh_interval == 0
+        ):
+            self._refresh_rollout_targets()
 
-        # 3) Physics-Informed Loss (PDE residual)
-        if counter_examples is not None and len(counter_examples) > 0:
-            ce_tensor = torch.as_tensor(counter_examples, dtype=torch.float32, device=self.device)
-            random_samples = sample_in_region_torch(self.batch_size - len(counter_examples), self.lb_tensor, self.ub_tensor, self.device)
-            # random_samples = sample_in_lqr_ellipsoid_torch(self.batch_size - len(counter_examples), self.agent.c_star, self.agent.L_inv, self.device)
-            init_states_in = torch.cat([ce_tensor, random_samples], dim=0)
-        else:
-            init_states_in = sample_in_region_torch(self.batch_size, self.lb_tensor, self.ub_tensor, self.device)
-            # init_states_in = sample_in_lqr_ellipsoid_torch(self.batch_size, self.agent.c_star, self.agent.L_inv, self.device)
+        rollout_states = self._rollout_states
+        rollout_targets = self._rollout_targets
 
-        init_states_in.requires_grad_(True)
-        Wx_in = self.agent.get_composite_W_value(init_states_in)
+        zero = torch.zeros((1, self.state_dim), dtype=torch.float32, device=self.device)
+        loss_zero = 5.0 * self.agent.critic_model(zero).square().mean()
 
-        grad_Wx_in, = torch.autograd.grad(
-            outputs=Wx_in.sum(), 
-            inputs=init_states_in, 
-            create_graph=True
+        rollout_values = self.agent.get_composite_W_value(rollout_states)
+        loss_rollout = F.mse_loss(rollout_values, rollout_targets)
+
+        physics_states = self._physics_samples(counter_examples).detach()
+        physics_states.requires_grad_(True)
+        values = self.agent.get_composite_W_value(physics_states)
+        (value_gradient,) = torch.autograd.grad(
+            values.sum(), physics_states, create_graph=True
         )
 
-        global_actions = self.agent._get_global_action(init_states_in)
-        current_actions = self.agent._get_blended_action(init_states_in, global_actions)
+        actions = self.agent.action_tensor(physics_states, noise=False)
+        vector_field = self.dynamics_fn(physics_states, actions)
+        phi = torch.linalg.vector_norm(physics_states, ord=2, dim=1)
+        residual = (
+            torch.sum(value_gradient * vector_field.detach(), dim=1)
+            + self.alpha_zubov * (1.0 - values.square()) * phi
+        )
+        loss_pde = residual.square().mean()
 
-        current_fxu = self.dynamics_fn(init_states_in, current_actions)
+        actor_gradient = value_gradient.detach()
+        if normalize_gradients:
+            actor_gradient = actor_gradient / torch.linalg.vector_norm(
+                actor_gradient, ord=2, dim=1, keepdim=True
+            ).clamp_min(1e-8)
+        loss_control = torch.sum(actor_gradient * vector_field, dim=1).mean()
 
-        phix = torch.norm(init_states_in, p=2, dim=1)
+        boundary_states = sample_out_of_region_torch(
+            self.batch_size,
+            self.lb_tensor,
+            self.ub_tensor,
+            scale=2.0,
+            device=self.device,
+        )
+        boundary_values = self.agent.get_composite_W_value(boundary_states)
+        loss_boundary = 5.0 * F.l1_loss(
+            boundary_values, torch.ones_like(boundary_values)
+        )
 
-        resid = torch.sum(grad_Wx_in * current_fxu.detach(), dim=1) + \
-            self.alpha_zubov * (1 + Wx_in.squeeze()) * (1 - Wx_in.squeeze()) * phix
-        Lp = torch.mean(torch.square(resid))
-
-        # 4) Encourage control actions that decrease the Lyapunov function
-        if normalize_gradients is True:
-            grad_norm = torch.linalg.vector_norm(grad_Wx_in, ord=2, dim=1, keepdim=True)
-            unit_grad = grad_Wx_in / (grad_norm + 1e-8)
-            Lc = 1.0 * torch.mean(torch.sum(unit_grad.detach() * current_fxu, dim=1))
-        else:
-            Lc = 1.0 * torch.mean(torch.sum(grad_Wx_in.detach() * current_fxu, dim=1))
-
-        # 5) Enforce that on the boundary of R2, W(x) \approx 1
-        init_states_out = sample_out_of_region_torch(self.batch_size, self.lb_tensor, self.ub_tensor, scale=2, device=self.device)
-        Wx_out = self.agent.get_composite_W_value(init_states_out)
-        # Wx_out = self.agent.critic_model(init_states_out)
-        Lb = 5.0 * F.l1_loss(Wx_out, torch.ones_like(Wx_out).to(self.device))
-
-        actor_loss = Lc
-        critic_loss = Lz + Lr + Lp + Lb
-
+        actor_loss = loss_control
+        critic_loss = loss_zero + loss_rollout + loss_pde + loss_boundary
         total_loss = 0.5 * actor_loss + critic_loss
-        self.agent.optimizer.zero_grad()
+        self.agent.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         self.agent.optimizer.step()
         self.agent.scheduler.step()
+        self._local_bridge_cache.clear()
 
         self.timesteps += 1
-        if self.timesteps % 20 == 0:
+        self.last_losses = {
+            "zero": loss_zero.item(),
+            "rollout": loss_rollout.item(),
+            "pde": loss_pde.item(),
+            "control": loss_control.item(),
+            "boundary": loss_boundary.item(),
+            "total": total_loss.item(),
+        }
+        if self.plot_interval and self.timesteps % self.plot_interval == 0:
             self.plot_level_set_and_trajectories()
-            
-        print(f"Lz: {Lz.item():.4f} | Lr: {Lr.item():.4f} | Lp: {Lp.item():.4f} | Lc: {Lc.item():.4f} | Lb: {Lb.item():.4f}")
         return actor_loss.item(), critic_loss.item()
 
     @torch.no_grad()
-    def simulate_trajectories(self, x: torch.Tensor, max_steps: int = 3000):
-        """
-        Vectorized simulation for a batch of trajectories.
-        :param x: Initial state tensor of shape [B, state_space].
-        :param max_steps: Maximum simulation steps.
-        :return: traj: tensor of shape [B, T, state_space] containing the full trajectory history,
-                integ_acc: integrated norm per trajectory,
-                converged: convergence flags.
-        """
-        B = x.shape[0]
-        integ_acc = torch.zeros(B, device=self.device)
-        active = torch.ones(B, dtype=torch.bool, device=self.device)
-        x_hist = [x.clone()]
-        buffer = x.clone()
+    def simulate_trajectories(self, x: torch.Tensor, max_steps: Optional[int] = None):
+        """Compatibility wrapper returning trajectory, cost, and convergence."""
+        rollout = rollout_running_cost(
+            initial_state=x,
+            dynamics=self.dynamics_fn,
+            policy=lambda state: self.agent.action_tensor(state, noise=False),
+            dt=self.dt,
+            max_steps=max_steps or self.rollout_steps,
+            convergence_threshold=self.norm_threshold,
+            running_cost_limit=self.integ_threshold,
+            store_trajectory=True,
+        )
+        return rollout.trajectory, rollout.running_cost, rollout.converged
 
-        for step in range(max_steps):
-            if not active.any():
-                break
-
-            norm = torch.linalg.vector_norm(x, ord=2, dim=1)
-            integ_acc[active] += norm[active] * self.dt
-
-            converged = norm < self.norm_threshold
-            if step >= 10:
-                stabilization = torch.linalg.vector_norm(x - buffer, ord=2, dim=1) < 1e-3 
-            else:
-                stabilization = torch.zeros_like(norm, dtype=torch.bool)
-            diverged = integ_acc > self.integ_threshold
-            finished = converged | stabilization | diverged
-            active = active & (~finished)
-
-            if step % 10 == 0:
-                buffer = x.clone()
-
-            if active.any():
-                pi_glob = self.agent.actor_model(x)
-                u = self.agent._get_blended_action(x, pi_glob)
-
-                if u.dim() == 1:
-                    u = u.unsqueeze(1)
-                x_next = rk4_step(self.dynamics_fn, x, u, dt=self.dt)
-                # Only update the active trajectories
-                x = torch.where(active.unsqueeze(1), x_next, x)
-                x_hist.append(x.clone())
-
-        traj = torch.stack(x_hist, dim=1)
-        final_norm = torch.linalg.vector_norm(x, ord=2, dim=1)
-        converged = final_norm < self.norm_threshold
-
-        return traj, integ_acc, converged
-    
+    @torch.no_grad()
     def plot_level_set_and_trajectories(self):
-        x_min, x_max = self.lb[0]*2, self.ub[0]*2
-        y_min, y_max = self.lb[1]*2, self.ub[1]*2
+        if self.state_dim != 2 or self.run_dir is None:
+            return
+        import matplotlib.pyplot as plt
 
-        xx = np.linspace(x_min, x_max, 500)
-        yy = np.linspace(y_min, y_max, 500)
-        X, Y = np.meshgrid(xx, yy)
-        grid_points = np.stack([X.flatten(), Y.flatten()], axis=1)
-        grid_tensor = torch.as_tensor(grid_points, dtype=torch.float32, device=self.device)
-        
-        with torch.no_grad():
-            Z = self.agent.get_composite_W_value(grid_tensor)
-            Z = Z.cpu().numpy()
-        Z = Z.reshape(X.shape)
-        
-        plt.figure(figsize=(6,5))
-        cp = plt.contourf(X, Y, Z, levels=100, cmap='viridis')
-        plt.colorbar(cp)
-        plt.title("Critic Level Set (Lyapunov Function)")
-        plt.xlabel("x[0]")
-        plt.ylabel("x[1]")
-        plt.xlim(x_min, x_max)
-        plt.ylim(y_min, y_max)
-
-        init_states = sample_in_region_torch(5, self.lb_tensor, self.ub_tensor, self.device)
-        # init_states = sample_in_lqr_ellipsoid_torch(5, self.agent.c_star, self.agent.L_inv, self.device)
-        trajs, _, _ = self.simulate_trajectories(init_states, max_steps=3000)
-        trajs_np = trajs.cpu().numpy()
-        
-        for i in range(trajs_np.shape[0]):
-            plt.plot(trajs_np[i, :, 0], trajs_np[i, :, 1], 'o-', markersize=1, linewidth=0.5, color='r')
-            plt.plot(trajs_np[i, 0, 0], trajs_np[i, 0, 1], 'r+')
-        
-        plt.gca().set_aspect('equal')
-        level_set_dir = os.path.join(self.run_dir, "level_sets")
-        os.makedirs(level_set_dir, exist_ok=True)
-        plot_path = os.path.join(level_set_dir, f"level_set_{self.timesteps}.png")
-        plt.savefig(plot_path)
-        plt.close()
-
-    def in_domain_dreal(self, x, scale=1.0):
-        return d.And(
-            x[0] >= self.lb[0] * scale,
-            x[0] <= self.ub[0] * scale,
-            x[1] >= self.lb[1] * scale,
-            x[1] <= self.ub[1] * scale
+        x_axis = np.linspace(self.lb[0] * 2, self.ub[0] * 2, self.plot_grid_size)
+        y_axis = np.linspace(self.lb[1] * 2, self.ub[1] * 2, self.plot_grid_size)
+        grid_x, grid_y = np.meshgrid(x_axis, y_axis)
+        points = np.stack((grid_x.ravel(), grid_y.ravel()), axis=1)
+        point_tensor = torch.as_tensor(points, dtype=torch.float32, device=self.device)
+        values = (
+            self.agent.get_composite_W_value(point_tensor)
+            .cpu()
+            .numpy()
+            .reshape(grid_x.shape)
         )
-    
-    def on_boundary_dreal(self, x, scale=2.0):
-        condition1 = d.And(
-            x[0] >= self.lb[0] * scale * 0.99,
-            x[0] <= self.ub[0] * scale * 0.99,
-            x[1] >= self.lb[1] * scale * 0.99,
-            x[1] <= self.ub[1] * scale * 0.99
+
+        initial_states = sample_in_region_torch(
+            5, self.lb_tensor, self.ub_tensor, self.device
         )
-        condition2 = d.Not(
-            d.And(
-                x[0] >= self.lb[0] * scale * 0.97,
-                x[0] <= self.ub[0] * scale * 0.97,
-                x[1] >= self.lb[1] * scale * 0.97,
-                x[1] <= self.ub[1] * scale * 0.97
+        trajectories, _, _ = self.simulate_trajectories(
+            initial_states, max_steps=min(self.rollout_steps, 1000)
+        )
+
+        figure, axis = plt.subplots(figsize=(6, 5))
+        contour = axis.contourf(grid_x, grid_y, values, levels=50, cmap="viridis")
+        figure.colorbar(contour, ax=axis)
+        for trajectory in trajectories.cpu().numpy():
+            axis.plot(
+                trajectory[:, 0],
+                trajectory[:, 1],
+                linewidth=0.7,
+                color="red",
             )
+        axis.set(
+            title="Composite Zubov candidate",
+            xlabel="x[0]",
+            ylabel="x[1]",
+            xlim=(x_axis[0], x_axis[-1]),
+            ylim=(y_axis[0], y_axis[-1]),
         )
-        return d.And( condition1, condition2 )
+        axis.set_aspect("equal")
+        output_dir = self.run_dir / "level_sets"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        figure.savefig(
+            output_dir / f"level_set_{self.timesteps}.png",
+            dpi=160,
+            bbox_inches="tight",
+        )
+        plt.close(figure)
 
-    def check_lyapunov_with_ce(self, level=0.9, scale=2., eps=0.5, delta=1e-4):
+    def check_lyapunov_with_ce(
+        self,
+        level=0.9,
+        scale=2.0,
+        eps=0.25,
+        delta=1e-4,
+        bridge_level=None,
+        local_margin=1e-4,
+    ):
+        """Verify a piecewise local/composite Lyapunov certificate.
+
+        ``V_local`` proves convergence inside the bridge. The learned
+        composite candidate proves decrease outside it. This closes the
+        historical unverified epsilon-ball gap.
         """
-        Checks the Lyapunov conditions for the FULL COMPOSITE agent.
-        This "translates" the original checker to the dual-policy framework.
-        """
-        print(f"Verifying COMPOSITE agent with c = {level:.4f} and eps = {eps:.2f}...")
-        
-        # Define dReal symbolic variable for the state
+        d = require_dreal()
+        if bridge_level is None:
+            lambda_min = np.linalg.eigvalsh(self.agent.lqr_agent.P_np).min()
+            bridge_level = float(lambda_min * eps**2)
+        if bridge_level <= 0:
+            raise ValueError("bridge_level must be positive")
+
         x = dreal_var(self.state_dim)
+        action = self.agent.symbolic_policy(x)
+        candidate = self.agent.symbolic_W_value(x)
+        local_value = self.agent.symbolic_local_lyapunov(x)
+        vector_field = self.dynamics_fn_dreal(x, action)
+        candidate_derivative = sum(
+            vector_field[i] * candidate.Differentiate(x[i])
+            for i in range(self.state_dim)
+        )
+        local_derivative = sum(
+            vector_field[i] * local_value.Differentiate(x[i])
+            for i in range(self.state_dim)
+        )
+        norm_sq = squared_norm(x)
+        domain = in_box(x, self.lb, self.ub, scale)
 
-        # === TRANSLATION STEP 1: Get the action u ===
-        # Instead of just the global actor, we build the full composite policy.
-        
-        # 1a. Get local LQR policy: pi_loc = -Kx
-        pi_loc_dreal = [-sum(self.agent.lqr_agent.K_np[i, j] * x[j] for j in range(self.state_dim)) for i in range(self.action_dim)]
-        
-        # 1b. Get global policy from the learned actor
-        pi_glo_dreal = self.agent.actor_model.forward_dreal(x)
-        
-        # 1c. Get blending weight h1 symbolically
-        V_loc_dreal = sum(x[i] * sum(self.agent.lqr_agent.P_np[i, j] * x[j] for j in range(self.state_dim)) for i in range(self.state_dim))
-        v_norm_dreal = V_loc_dreal / self.agent.blending_function.c_star
-        h1_dreal = d.tanh(self.agent.blending_function.s_factor.item() * v_norm_dreal)
-        
-        # 1d. The final blended action `u` is the composite policy
-        u = [pi_loc_dreal[i] + h1_dreal * (pi_glo_dreal[i] - pi_loc_dreal[i]) for i in range(self.action_dim)]
-        
-        # === TRANSLATION STEP 2: Get the Lyapunov value Wx ===
-        # Instead of just the global critic, we build the full composite W value.
-
-        # 2a. Get global value from the learned critic
-        W_glo_dreal = self.agent.critic_model.forward_dreal(x)[0]
-        
-        # 2b. Get local value W_loc = tanh(alpha * V_loc)
-        W_loc_dreal = d.tanh(self.alpha_zubov * V_loc_dreal)
-
-        # 2c. Get blending weight h2 symbolically
-        h2_dreal = d.tanh(self.agent.blending_function.s_factor.item() * d.pow(v_norm_dreal, 1.5))
-        
-        # 2d. The final Lyapunov value `Wx` is the composite critic value
-        Wx = W_loc_dreal + h2_dreal * (W_glo_dreal - W_loc_dreal)
-        
-        # === TRANSLATION STEP 3: Get W(0) ===
-        # For the composite agent, W_comp(0) is always 0 by construction.
-        W0 = 0.0
-
-        # === STEP 4: Calculate Lie Derivative and check conditions ===
-        # This logic remains the same, but now uses our composite `u` and `Wx`.
-        fx = self.dynamics_fn_dreal(x, u)
-        lie_derivative_W = sum(fx[i] * Wx.Differentiate(x[i]) for i in range(self.state_dim))
-        x_norm = d.sqrt(sum(xi * xi for xi in x))
-
-        # Condition 1: Find a violation of stability inside the level set
-        violation_condition = d.And(
-            x_norm >= eps,
-            self.in_domain_dreal(x, scale), 
-            Wx <= level,
-            d.Or(
-                lie_derivative_W >= 0,
-                Wx <= W0
+        cache_key = (
+            float(scale),
+            float(bridge_level),
+            float(local_margin),
+            float(delta),
+        )
+        cached_local = self._local_bridge_cache.get(cache_key)
+        if cached_local is None:
+            local_violation = d.And(
+                domain,
+                local_value <= bridge_level,
+                local_derivative + local_margin * norm_sq > 0,
             )
-        )
-        r1 = d.CheckSatisfiability(violation_condition, delta)
-        if r1:
-            print("FALSIFIED: Found counter-example violating Lie derivative or positivity.")
-            return (False, r1)
+            local_result = d.CheckSatisfiability(local_violation, delta)
+            bridge_boundary_contact = d.And(
+                on_boundary(x, self.lb, self.ub, scale),
+                local_value <= bridge_level,
+            )
+            bridge_boundary_result = d.CheckSatisfiability(
+                bridge_boundary_contact, delta
+            )
+            cached_local = (local_result, bridge_boundary_result)
+            self._local_bridge_cache[cache_key] = cached_local
+        else:
+            local_result, bridge_boundary_result = cached_local
 
-        boundary_condition = d.And(
-            self.on_boundary_dreal(x, scale=scale),
-            Wx <= level
-        )
-        r2 = d.CheckSatisfiability(boundary_condition, delta)
-        if r2:
-            print("FALSIFIED: Composite RoA level set touches the boundary of the verified region.")
-            return (False, r2)
+        if not is_unsat(local_result):
+            self.last_verification = {
+                "passed": False,
+                "reason": "local_bridge_decrease",
+                "level": float(level),
+                "bridge_level": bridge_level,
+                "eps": eps,
+                "delta": delta,
+            }
+            return False, local_result
 
-        print("Verification PASSED for the composite agent at this level.")
-        return (True, None)
+        if not is_unsat(bridge_boundary_result):
+            self.last_verification = {
+                "passed": False,
+                "reason": "local_bridge_boundary",
+                "level": float(level),
+                "bridge_level": bridge_level,
+                "eps": eps,
+                "delta": delta,
+            }
+            return False, bridge_boundary_result
+
+        outer_violation = d.And(
+            domain,
+            local_value >= bridge_level,
+            candidate <= level,
+            d.Or(candidate_derivative >= 0, candidate <= 0),
+        )
+        outer_result = d.CheckSatisfiability(outer_violation, delta)
+        if not is_unsat(outer_result):
+            self.last_verification = {
+                "passed": False,
+                "reason": "composite_candidate",
+                "level": float(level),
+                "bridge_level": bridge_level,
+                "eps": eps,
+                "delta": delta,
+            }
+            return False, outer_result
+
+        boundary_contact = d.And(
+            on_boundary(x, self.lb, self.ub, scale),
+            candidate <= level,
+        )
+        boundary_result = d.CheckSatisfiability(boundary_contact, delta)
+        if not is_unsat(boundary_result):
+            self.last_verification = {
+                "passed": False,
+                "reason": "outer_boundary",
+                "level": float(level),
+                "bridge_level": bridge_level,
+                "eps": eps,
+                "delta": delta,
+            }
+            return False, boundary_result
+
+        self.last_verification = {
+            "passed": True,
+            "reason": None,
+            "level": float(level),
+            "bridge_level": bridge_level,
+            "eps": eps,
+            "local_margin": local_margin,
+            "delta": delta,
+        }
+        return True, None

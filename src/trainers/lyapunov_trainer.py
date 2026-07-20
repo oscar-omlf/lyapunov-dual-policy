@@ -1,35 +1,41 @@
-import os
-from typing import Callable
+from pathlib import Path
+from typing import Callable, Optional
+
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.optim.lr_scheduler import StepLR
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from typing import Union
 
-from agents.abstract_agent import AbstractAgent
 from trainers.abstract_trainer import Trainer
-from util.sampling import sample_in_region_torch, sample_out_of_region_torch
-from util.sampling import sample_in_lqr_ellipsoid_torch, sample_on_circle_boundary_torch
-from util.rk4_step import rk4_step
-
-import dreal as d
-from util.dreal import dreal_var
-from util.dreal import dreal_in_circle, dreal_on_circle_boundary
+from util.dreal import (
+    dreal_var,
+    in_box,
+    is_unsat,
+    on_boundary,
+    require_dreal,
+    squared_norm,
+)
+from util.sampling import (
+    sample_in_region_torch,
+    sample_out_of_region_torch,
+)
+from util.simulation import RolloutResult, rollout_running_cost
 
 
 class LyapunovTrainer(Trainer):
+    """Standalone physics-informed Lyapunov actor-critic baseline."""
+
     def __init__(
-        self, 
-        actor: nn.Module, 
+        self,
+        actor: nn.Module,
         critic: nn.Module,
-        lr: float, 
+        lr: float,
         alpha: float,
         batch_size: int,
         num_paths_sampled: int,
         norm_threshold: float,
-        integ_threshold: int,
+        integ_threshold: float,
         dt: float,
         dynamics_fn: Callable,
         dynamics_fn_dreal: Callable,
@@ -37,327 +43,322 @@ class LyapunovTrainer(Trainer):
         r1_bounds: list,
         run_dir: str,
         device: str,
+        rollout_steps: int = 3000,
+        rollout_refresh_interval: int = 10,
+        plot_interval: int = 0,
+        plot_grid_size: int = 201,
     ):
         super().__init__()
         self.actor_model = actor
         self.critic_model = critic
-
-        self.alpha_zubov = alpha
-        self.batch_size = batch_size
-        self.num_paths_sampled = num_paths_sampled
-        self.norm_threshold = norm_threshold
-        self.integ_threshold = integ_threshold
-        self.dt = dt
-
+        self.alpha_zubov = float(alpha)
+        self.batch_size = int(batch_size)
+        self.num_paths_sampled = int(num_paths_sampled)
+        self.norm_threshold = float(norm_threshold)
+        self.integ_threshold = float(integ_threshold)
+        self.dt = float(dt)
         self.dynamics_fn = dynamics_fn
         self.dynamics_fn_dreal = dynamics_fn_dreal
-
-        self.state_dim = state_dim
-        self.lb, self.ub = r1_bounds
-
-        self.run_dir = run_dir
-
+        self.state_dim = int(state_dim)
+        self.lb, self.ub = (
+            np.asarray(r1_bounds[0]),
+            np.asarray(r1_bounds[1]),
+        )
+        self.run_dir = Path(run_dir) if run_dir else None
         self.device = device
+        self.rollout_steps = int(rollout_steps)
+        self.rollout_refresh_interval = int(rollout_refresh_interval)
+        self.plot_interval = int(plot_interval)
+        self.plot_grid_size = int(plot_grid_size)
+        if self.rollout_refresh_interval <= 0:
+            raise ValueError("rollout_refresh_interval must be positive")
 
-        self.lb_tensor = torch.tensor(self.lb, dtype=torch.float32, device=self.device)
-        self.ub_tensor = torch.tensor(self.ub, dtype=torch.float32, device=self.device)
-
-        self.optimizer = torch.optim.Adam(list(actor.parameters()) + list(critic.parameters()), lr=lr)
+        self.lb_tensor = torch.as_tensor(
+            self.lb, dtype=torch.float32, device=self.device
+        )
+        self.ub_tensor = torch.as_tensor(
+            self.ub, dtype=torch.float32, device=self.device
+        )
+        self.optimizer = torch.optim.Adam(
+            list(actor.parameters()) + list(critic.parameters()), lr=lr
+        )
         self.scheduler = StepLR(self.optimizer, step_size=500, gamma=0.8)
-
         self.timesteps = 0
+        self._rollout_states: Optional[torch.Tensor] = None
+        self._rollout_targets: Optional[torch.Tensor] = None
+        self.last_rollout: Optional[RolloutResult] = None
+        self.last_losses = {}
+        self.last_verification = {}
 
-        print('Lyapunov Trainer Initialized (Standalone LAC)!')
+    def _action(self, state):
+        return self.actor_model(state)
 
-    def train(self, counter_examples: list = None, normalize_gradients: bool = False):
-        init_states = sample_in_region_torch(self.num_paths_sampled, self.lb_tensor, self.ub_tensor, self.device)
-        # init_states = sample_in_lqr_ellipsoid_torch(self.num_paths_sampled, self.c_star, self.L_inv, self.device)
-        traj, values, _ = self.simulate_trajectories(init_states, max_steps=3000)
-        values = values.to(dtype=torch.float32, device=self.device)
+    def _refresh_rollout_targets(self):
+        states = sample_in_region_torch(
+            self.num_paths_sampled,
+            self.lb_tensor,
+            self.ub_tensor,
+            self.device,
+        )
+        rollout = rollout_running_cost(
+            initial_state=states,
+            dynamics=self.dynamics_fn,
+            policy=self._action,
+            dt=self.dt,
+            max_steps=self.rollout_steps,
+            convergence_threshold=self.norm_threshold,
+            running_cost_limit=self.integ_threshold,
+        )
+        self._rollout_states = states
+        self._rollout_targets = rollout.zubov_target(self.alpha_zubov)
+        self.last_rollout = rollout
 
-        # 1) Enforce W(0) = 0
-        zeros_tensor = torch.zeros((1, self.state_dim), dtype=torch.float32, device=self.device)
-        W_zeros = self.critic_model(zeros_tensor)
-        Lz = 5.0 * torch.square(W_zeros) 
+    def _physics_samples(self, counter_examples):
+        if not counter_examples:
+            return sample_in_region_torch(
+                self.batch_size,
+                self.lb_tensor,
+                self.ub_tensor,
+                self.device,
+            )
+        counterexample_tensor = torch.as_tensor(
+            counter_examples, dtype=torch.float32, device=self.device
+        ).reshape(-1, self.state_dim)
+        counterexample_tensor = counterexample_tensor[-self.batch_size :]
+        random_count = self.batch_size - counterexample_tensor.shape[0]
+        random_samples = sample_in_region_torch(
+            random_count,
+            self.lb_tensor,
+            self.ub_tensor,
+            self.device,
+        )
+        return torch.cat((counterexample_tensor, random_samples), dim=0)
 
-        # 2) Enforce W(x) = tanh(alpha * V(x))
-        Wx_Lr = self.critic_model(init_states)
-        target = torch.tanh(self.alpha_zubov * values)
-        Lr = F.mse_loss(Wx_Lr, target)
+    def train(self, counter_examples=None, normalize_gradients=False):
+        if (
+            self._rollout_states is None
+            or self.timesteps % self.rollout_refresh_interval == 0
+        ):
+            self._refresh_rollout_targets()
 
-        # 3) Physics-Informed Loss (PDE residual)
-        if counter_examples is not None and len(counter_examples) > 0:
-            ce_tensor = torch.as_tensor(counter_examples, dtype=torch.float32, device=self.device)
-            random_samples = sample_in_region_torch(self.batch_size - len(counter_examples), self.lb_tensor, self.ub_tensor, self.device)
-            # random_samples = sample_in_lqr_ellipsoid_torch(self.batch_size - len(counter_examples), self.c_star, self.L_inv, self.device)
-            init_states_in = torch.cat([ce_tensor, random_samples], dim=0)
-        else:
-            init_states_in = sample_in_region_torch(self.batch_size, self.lb_tensor, self.ub_tensor, self.device)
-            # init_states_in = sample_in_lqr_ellipsoid_torch(self.batch_size, self.c_star, self.L_inv, self.device)
+        zero = torch.zeros((1, self.state_dim), dtype=torch.float32, device=self.device)
+        loss_zero = 5.0 * self.critic_model(zero).square().mean()
+        loss_rollout = F.mse_loss(
+            self.critic_model(self._rollout_states),
+            self._rollout_targets,
+        )
 
-        Wx_in, grad_Wx_in = self.critic_model.forward_with_grad(init_states_in)
+        physics_states = self._physics_samples(counter_examples).detach()
+        physics_states.requires_grad_(True)
+        values = self.critic_model(physics_states)
+        (value_gradient,) = torch.autograd.grad(
+            values.sum(), physics_states, create_graph=True
+        )
+        actions = self.actor_model(physics_states)
+        vector_field = self.dynamics_fn(physics_states, actions)
+        phi = torch.linalg.vector_norm(physics_states, ord=2, dim=1)
+        residual = (
+            torch.sum(value_gradient * vector_field.detach(), dim=1)
+            + self.alpha_zubov * (1.0 - values.square()) * phi
+        )
+        loss_pde = residual.square().mean()
 
-        current_actions = self.actor_model(init_states_in)
-        current_fxu = self.dynamics_fn(init_states_in, current_actions)
-        
-        phix = torch.norm(init_states_in, p=2, dim=1) 
+        actor_gradient = value_gradient.detach()
+        if normalize_gradients:
+            actor_gradient = actor_gradient / torch.linalg.vector_norm(
+                actor_gradient, ord=2, dim=1, keepdim=True
+            ).clamp_min(1e-8)
+        loss_control = torch.sum(actor_gradient * vector_field, dim=1).mean()
 
-        resid = torch.sum(grad_Wx_in * current_fxu.detach(), dim=1) + \
-            self.alpha_zubov * (1 + Wx_in.squeeze()) * (1 - Wx_in.squeeze()) * phix
-        Lp = torch.mean(torch.square(resid))
+        boundary_states = sample_out_of_region_torch(
+            self.batch_size,
+            self.lb_tensor,
+            self.ub_tensor,
+            scale=2.0,
+            device=self.device,
+        )
+        boundary_values = self.critic_model(boundary_states)
+        loss_boundary = 5.0 * F.l1_loss(
+            boundary_values, torch.ones_like(boundary_values)
+        )
 
-        # 4) Encourage control actions that decrease the Lyapunov function
-        if normalize_gradients is True:
-            grad_norm = torch.linalg.vector_norm(grad_Wx_in, ord=2, dim=1, keepdim=True)
-            unit_grad = grad_Wx_in / (grad_norm + 1e-8)
-            Lc = 1.0 * torch.mean(torch.sum(unit_grad.detach() * current_fxu, dim=1))
-        else:
-            Lc = 1.0 * torch.mean(torch.sum(grad_Wx_in.detach() * current_fxu, dim=1))
-
-        # 5) Enforce that on the boundary of R2, W(x) \approx 1
-        init_states_out = sample_out_of_region_torch(self.batch_size, self.lb_tensor, self.ub_tensor, scale=2, device=self.device)
-        # init_states_out = sample_on_circle_boundary_torch(self.batch_size, self.state_dim, self.r2_radius, self.device)
-        Wx_out = self.critic_model(init_states_out) 
-        # Lb = 5.0 * torch.mean(torch.abs(Wx_out - 1.0))
-        Lb = 5.0 * F.l1_loss(Wx_out, torch.ones_like(Wx_out).to(self.device))
-
-        actor_loss = Lc # + 0.2 * Lp
-        critic_loss = Lz + Lr + Lp + Lb
-
+        actor_loss = loss_control
+        critic_loss = loss_zero + loss_rollout + loss_pde + loss_boundary
         total_loss = 0.5 * actor_loss + critic_loss
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         self.optimizer.step()
         self.scheduler.step()
 
         self.timesteps += 1
-        if self.timesteps % 200 == 0:
+        self.last_losses = {
+            "zero": loss_zero.item(),
+            "rollout": loss_rollout.item(),
+            "pde": loss_pde.item(),
+            "control": loss_control.item(),
+            "boundary": loss_boundary.item(),
+            "total": total_loss.item(),
+        }
+        if self.plot_interval and self.timesteps % self.plot_interval == 0:
             self.plot_level_set_and_trajectories()
-
-        print(f"Lz: {Lz.item():.4f} | Lr: {Lr.item():.4f} | Lp: {Lp.item():.4f} | Lc: {Lc.item():.4f} | Lb: {Lb.item():.4f}")
         return actor_loss.item(), critic_loss.item()
 
     @torch.no_grad()
-    def simulate_trajectories(self, x: torch.Tensor, max_steps: int = 3000):
-        """
-        Vectorized simulation for a batch of trajectories.
-        :param x: Initial state tensor of shape [B, state_space].
-        :param max_steps: Maximum simulation steps.
-        :return: traj: tensor of shape [B, T, state_space] containing the full trajectory history,
-                integ_acc: integrated norm per trajectory,
-                converged: convergence flags.
-        """
-        B = x.shape[0]
-        integ_acc = torch.zeros(B, device=self.device)
-        active = torch.ones(B, dtype=torch.bool, device=self.device)
-        x_hist = [x.clone()]
-        buffer = x.clone()
+    def simulate_trajectories(self, x, max_steps=None):
+        rollout = rollout_running_cost(
+            initial_state=x,
+            dynamics=self.dynamics_fn,
+            policy=self._action,
+            dt=self.dt,
+            max_steps=max_steps or self.rollout_steps,
+            convergence_threshold=self.norm_threshold,
+            running_cost_limit=self.integ_threshold,
+            store_trajectory=True,
+        )
+        return rollout.trajectory, rollout.running_cost, rollout.converged
 
-        for step in range(max_steps):
-            if not active.any():
-                break
-
-            norm = torch.linalg.vector_norm(x, ord=2, dim=1)
-            integ_acc[active] += norm[active] * self.dt
-
-            converged = norm < self.norm_threshold
-            if step >= 10:
-                stabilization = torch.linalg.vector_norm(x - buffer, ord=2, dim=1) < 1e-3 
-            else:
-                stabilization = torch.zeros_like(norm, dtype=torch.bool)
-            diverged = integ_acc > self.integ_threshold
-            finished = converged | stabilization | diverged
-            active = active & (~finished)
-
-            if step % 10 == 0:
-                buffer = x.clone()
-
-            if active.any():
-                u = self.actor_model(x)
-                if u.dim() == 1:
-                    u = u.unsqueeze(1)
-                x_next = rk4_step(self.dynamics_fn, x, u, dt=self.dt)
-                # Only update the active trajectories
-                x = torch.where(active.unsqueeze(1), x_next, x)
-                x_hist.append(x.clone())
-
-        traj = torch.stack(x_hist, dim=1)
-        final_norm = torch.linalg.vector_norm(x, ord=2, dim=1)
-        converged = final_norm < self.norm_threshold
-
-        return traj, integ_acc, converged
-
+    @torch.no_grad()
     def plot_level_set_and_trajectories(self):
-        x_min, x_max = self.lb[0]*2, self.ub[0]*2
-        y_min, y_max = self.lb[1]*2, self.ub[1]*2
+        if self.state_dim != 2 or self.run_dir is None:
+            return
+        import matplotlib.pyplot as plt
 
-        xx = np.linspace(x_min, x_max, 3000)
-        yy = np.linspace(y_min, y_max, 3000)
-        X, Y = np.meshgrid(xx, yy)
-        grid_points = np.stack([X.flatten(), Y.flatten()], axis=1)
-        grid_tensor = torch.as_tensor(grid_points, dtype=torch.float32, device=self.device)
-        
-        with torch.no_grad():
-            Z = self.critic_model(grid_tensor)
-            Z = Z.cpu().numpy()
-        Z = Z.reshape(X.shape)
-        
-        plt.figure(figsize=(6,5))
-        cp = plt.contourf(X, Y, Z, levels=100, cmap='viridis')
-        plt.colorbar(cp)
-        plt.title("Critic Level Set (Lyapunov Function)")
-        plt.xlabel("x[0]")
-        plt.ylabel("x[1]")
-        plt.xlim(x_min, x_max)
-        plt.ylim(y_min, y_max)
+        x_axis = np.linspace(self.lb[0] * 2, self.ub[0] * 2, self.plot_grid_size)
+        y_axis = np.linspace(self.lb[1] * 2, self.ub[1] * 2, self.plot_grid_size)
+        grid_x, grid_y = np.meshgrid(x_axis, y_axis)
+        points = torch.as_tensor(
+            np.stack((grid_x.ravel(), grid_y.ravel()), axis=1),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        values = self.critic_model(points).cpu().numpy().reshape(grid_x.shape)
+        initial_states = sample_in_region_torch(
+            5, self.lb_tensor, self.ub_tensor, self.device
+        )
+        trajectories, _, _ = self.simulate_trajectories(
+            initial_states, max_steps=min(self.rollout_steps, 1000)
+        )
 
-        init_states = sample_in_region_torch(5, self.lb_tensor, self.ub_tensor, self.device)
-        # init_states = sample_in_lqr_ellipsoid_torch(5, self.c_star, self.L_inv, self.device)
-        trajs, _, _ = self.simulate_trajectories(init_states, max_steps=3000)
-        trajs_np = trajs.cpu().numpy()
-        
-        for i in range(trajs_np.shape[0]):
-            plt.plot(trajs_np[i, :, 0], trajs_np[i, :, 1], 'o-', markersize=1, linewidth=0.5, color='r')
-            plt.plot(trajs_np[i, 0, 0], trajs_np[i, 0, 1], 'r+')
-        
-        plt.gca().set_aspect('equal')
-        level_set_dir = os.path.join(self.run_dir, "level_sets")
-        os.makedirs(level_set_dir, exist_ok=True)
-        plot_path = os.path.join(level_set_dir, f"level_set_{self.timesteps}.png")
-        plt.savefig(plot_path)
-        plt.close()
+        figure, axis = plt.subplots(figsize=(6, 5))
+        contour = axis.contourf(grid_x, grid_y, values, levels=50, cmap="viridis")
+        figure.colorbar(contour, ax=axis)
+        for trajectory in trajectories.cpu().numpy():
+            axis.plot(
+                trajectory[:, 0],
+                trajectory[:, 1],
+                linewidth=0.7,
+                color="red",
+            )
+        axis.set(
+            title="Standalone Zubov candidate",
+            xlabel="x[0]",
+            ylabel="x[1]",
+        )
+        axis.set_aspect("equal")
+        output_dir = self.run_dir / "level_sets"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        figure.savefig(
+            output_dir / f"level_set_{self.timesteps}.png",
+            dpi=160,
+            bbox_inches="tight",
+        )
+        plt.close(figure)
 
     def _sanity_network(self):
-        x_np = np.random.randn(self.state_dim)
-        x_d  = dreal_var(self.state_dim)
-        y_pt = self.actor_model(torch.as_tensor(x_np, dtype=torch.float32, device=self.device).unsqueeze(0))[0].item()
-        y_dr = self.actor_model.forward_dreal(x_d)[0]
-        fsat = d.And(*[x_d[i] == x_np[i] for i in range(self.state_dim)],
-                     y_dr >= y_pt - 1e-3,
-                     y_dr <= y_pt + 1e-3)
-        assert d.CheckSatisfiability(fsat, 1e-4) is not None
+        d = require_dreal()
+        x_numpy = np.random.randn(self.state_dim)
+        x_symbolic = dreal_var(self.state_dim)
+        y_torch = self.actor_model(
+            torch.as_tensor(x_numpy, dtype=torch.float32, device=self.device).unsqueeze(
+                0
+            )
+        )[0, 0].item()
+        y_symbolic = self.actor_model.forward_dreal(x_symbolic)[0]
+        formula = d.And(
+            *[x_symbolic[i] == x_numpy[i] for i in range(self.state_dim)],
+            y_symbolic >= y_torch - 1e-3,
+            y_symbolic <= y_torch + 1e-3,
+        )
+        assert d.CheckSatisfiability(formula, 1e-4) is not None
 
     def _sanity_dynamics(self):
-        x_np = np.random.randn(self.state_dim)
-        u_np = np.random.randn(1)
-        x_d  = dreal_var(self.state_dim)
-        u_d  = dreal_var(1, "u")
-        f_pt = self.dynamics_fn(torch.as_tensor(x_np).unsqueeze(0),
-                                torch.as_tensor(u_np).unsqueeze(0))[0].cpu().numpy()
-        f_dr = self.dynamics_fn_dreal(x_d, u_d)
-        cons = [x_d[i] == x_np[i] for i in range(self.state_dim)] + \
-               [u_d[0] == u_np[0]] + \
-               [f_dr[i] >= f_pt[i]-1e-3 for i in range(self.state_dim)] + \
-               [f_dr[i] <= f_pt[i]+1e-3 for i in range(self.state_dim)]
-        assert d.CheckSatisfiability(d.And(*cons), 1e-4) is not None
+        d = require_dreal()
+        x_numpy = np.random.randn(self.state_dim)
+        u_numpy = np.random.randn(1)
+        x_symbolic = dreal_var(self.state_dim)
+        u_symbolic = dreal_var(1, "u")
+        f_torch = self.dynamics_fn(
+            torch.as_tensor(x_numpy, dtype=torch.float32).unsqueeze(0),
+            torch.as_tensor(u_numpy, dtype=torch.float32).unsqueeze(0),
+        )[0].numpy()
+        f_symbolic = self.dynamics_fn_dreal(x_symbolic, u_symbolic)
+        constraints = [x_symbolic[i] == x_numpy[i] for i in range(self.state_dim)]
+        constraints.append(u_symbolic[0] == u_numpy[0])
+        constraints.extend(
+            f_symbolic[i] >= f_torch[i] - 1e-3 for i in range(self.state_dim)
+        )
+        constraints.extend(
+            f_symbolic[i] <= f_torch[i] + 1e-3 for i in range(self.state_dim)
+        )
+        assert d.CheckSatisfiability(d.And(*constraints), 1e-4) is not None
 
-    def in_domain_dreal(self, x, scale=1.0):
-        return d.And(
-            x[0] >= self.lb[0] * scale,
-            x[0] <= self.ub[0] * scale,
-            x[1] >= self.lb[1] * scale,
-            x[1] <= self.ub[1] * scale
+    def check_lyapunov(self, level=0.9, scale=2.0, eps=0.5, delta=1e-4):
+        passed, model = self.check_lyapunov_with_ce(
+            level=level, scale=scale, eps=eps, delta=delta
         )
-    
-    def on_boundary_dreal(self, x, scale=2.0):
-        condition1 = d.And(
-            x[0] >= self.lb[0] * scale * 0.99,
-            x[0] <= self.ub[0] * scale * 0.99,
-            x[1] >= self.lb[1] * scale * 0.99,
-            x[1] <= self.ub[1] * scale * 0.99
-        )
-        condition2 = d.Not(
-            d.And(
-                x[0] >= self.lb[0] * scale * 0.97,
-                x[0] <= self.ub[0] * scale * 0.97,
-                x[1] >= self.lb[1] * scale * 0.97,
-                x[1] <= self.ub[1] * scale * 0.97
-            )
-        )
-        return d.And( condition1, condition2 )
+        return (None, None) if passed else (model, model)
 
-    def check_lyapunov(self, level=0.9, scale=2., eps=0.5):
-        print('Standalone LyAC Lyapunov Checker')
-        W0 = self.critic_model(torch.zeros((1, self.state_dim), device=self.device))
-        W0 = W0.squeeze().item()
+    def check_lyapunov_with_ce(self, level=0.9, scale=2.0, eps=0.5, delta=1e-4):
+        """Verify the learned candidate on an annulus outside ``eps``."""
+        d = require_dreal()
+        with torch.no_grad():
+            value_at_origin = self.critic_model(
+                torch.zeros(
+                    (1, self.state_dim),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            ).item()
+
         x = dreal_var(self.state_dim)
-        x_norm = d.Expression(0.)
-        lie_derivative_W = d.Expression(0.)
-
-        # construct xnorm and f(x, u)^T \nabla_x W(x)
-        u = self.actor_model.forward_dreal(x)
-        fx = self.dynamics_fn_dreal(x, u)
-        Wx = self.critic_model.forward_dreal(x)[0]
-
-        # construct x_norm and <fx, \grad_x W(x)>
-        for i in range(self.state_dim):
-            x_norm += x[i] * x[i]
-            lie_derivative_W += fx[i] * Wx.Differentiate(x[i])
-        x_norm = d.sqrt(x_norm)
-
-        condition = d.And(
-            x_norm >= eps,
-            self.in_domain_dreal(x, scale),
-            # dreal_in_circle(x, self.r2_radius),
-            Wx <= level,
-            d.Or(
-                lie_derivative_W >= 0,
-                Wx <= W0
-            )
+        action = self.actor_model.forward_dreal(x)
+        vector_field = self.dynamics_fn_dreal(x, action)
+        candidate = self.critic_model.forward_dreal(x)[0]
+        derivative = sum(
+            vector_field[i] * candidate.Differentiate(x[i])
+            for i in range(self.state_dim)
         )
-        r1 = d.CheckSatisfiability(condition, 0.001)
-        
-        r2 = d.CheckSatisfiability(
-            d.And(
-                self.on_boundary_dreal(x, scale=scale),
-                # dreal_on_circle_boundary(x, self.r2_radius),
-                Wx <= level
-            ),
-            0.001
+        norm_sq = squared_norm(x)
+        violation = d.And(
+            norm_sq >= eps**2,
+            in_box(x, self.lb, self.ub, scale),
+            candidate <= level,
+            d.Or(derivative >= 0, candidate <= value_at_origin),
         )
-        print('----------')
-        print(r1)
-        print(r2)
-        print('----------')
-        return r1, r2
+        violation_result = d.CheckSatisfiability(violation, delta)
+        if not is_unsat(violation_result):
+            self.last_verification = {
+                "passed": False,
+                "scope": "annular",
+                "reason": "candidate",
+                "eps": eps,
+                "level": level,
+                "delta": delta,
+            }
+            return False, violation_result
 
-    def check_lyapunov_with_ce(self, level=0.9, scale=2., eps=0.5, delta=1e-4):
-        print(f"Verifying with c = {level:.4f} and eps = {eps:.2f}...")
-        W0 = self.critic_model(torch.zeros((1, self.state_dim), device=self.device)).squeeze().item()
-        
-        x = dreal_var(self.state_dim)
-        
-        u = self.actor_model.forward_dreal(x)
-        fx = self.dynamics_fn_dreal(x, u)
-        Wx = self.critic_model.forward_dreal(x)[0]
-        
-        lie_derivative_W = sum(fx[i] * Wx.Differentiate(x[i]) for i in range(self.state_dim))
-        x_norm = d.sqrt(sum(xi * xi for xi in x))
-
-        violation_condition = d.And(
-            x_norm >= eps,
-            self.in_domain_dreal(x, scale),
-            # dreal_in_circle(x, self.r2_radius),
-            Wx <= level,
-            d.Or(
-                lie_derivative_W >= 0,
-                Wx <= W0
-            )
+        boundary_contact = d.And(
+            on_boundary(x, self.lb, self.ub, scale),
+            candidate <= level,
         )
-        r1 = d.CheckSatisfiability(violation_condition, delta)
-        if r1:
-            print("FALSIFIED: Found counter-example violating Lie derivative or positivity.")
-            return (False, r1)
-
-        boundary_condition = d.And(
-            self.on_boundary_dreal(x, scale=scale),
-            # dreal_on_circle_boundary(x, self.r2_radius),
-            Wx <= level
-        )
-        r2 = d.CheckSatisfiability(boundary_condition, delta)
-        if r2:
-            print("FALSIFIED: RoA level set touches the boundary of the verified region.")
-            return (False, r2)
-
-        print("Verification PASSED for this level")
-        return (True, None)
+        boundary_result = d.CheckSatisfiability(boundary_contact, delta)
+        passed = is_unsat(boundary_result)
+        self.last_verification = {
+            "passed": passed,
+            "scope": "annular",
+            "reason": None if passed else "outer_boundary",
+            "eps": eps,
+            "level": level,
+            "delta": delta,
+        }
+        return (True, None) if passed else (False, boundary_result)

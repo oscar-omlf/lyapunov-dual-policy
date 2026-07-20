@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -13,25 +12,20 @@ class LyapunovCritic(nn.Module):
             hidden_sizes=hidden_sizes,
             output_size=1,
             inner_activation=inner_activation,
-            output_activation=nn.Sigmoid()
+            output_activation=nn.Sigmoid(),
         )
 
     def forward(self, x):
         return self.model(x).squeeze(-1)
-    
+
     def forward_with_grad(self, x):
-        x.requires_grad_(True)        
+        if not x.requires_grad:
+            x = x.detach().requires_grad_(True)
         y = self(x)
-        
-        grad = torch.autograd.grad(
-            outputs=y.sum(), 
-            inputs=x, 
-            create_graph=True
-        )[0]
-        
-        x.requires_grad_(False)
+
+        grad = torch.autograd.grad(outputs=y.sum(), inputs=x, create_graph=True)[0]
+
         return y, grad
 
     def forward_dreal(self, x_vars):
         return self.model.forward_dreal(x_vars)
-    

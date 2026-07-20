@@ -175,6 +175,11 @@ cython_debug/
 # Logs
 logs
 *.log
+runs/
+
+# Learned artifacts
+*.pt
+*.pth
 
 pendulum
 
@@ -189,3 +194,6 @@ best_models
 *.png
 *.def
 *.sif
+
+# macOS
+.DS_Store

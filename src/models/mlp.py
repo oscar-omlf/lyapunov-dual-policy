@@ -1,12 +1,18 @@
 import numpy as np
 import torch.nn as nn
-import dreal as d
 
-from util.dreal import dreal_var, dreal_elementwise, dreal_sigmoid
+from util.dreal import dreal_elementwise, dreal_sigmoid, require_dreal
 
 
 class MLP(nn.Module):
-    def __init__(self, input_size, hidden_sizes, output_size, inner_activation=nn.ReLU, output_activation=None):
+    def __init__(
+        self,
+        input_size,
+        hidden_sizes,
+        output_size,
+        inner_activation=nn.ReLU,
+        output_activation=None,
+    ):
         """
         :param inner_activation: activation function to use for all hidden layers.
         """
@@ -26,6 +32,7 @@ class MLP(nn.Module):
         return self.net(x)
 
     def forward_dreal(self, x_vars: np.ndarray):
+        d = require_dreal()
         x = x_vars
         for layer in self.net:
             if isinstance(layer, nn.Linear):
